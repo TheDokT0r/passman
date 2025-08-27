@@ -1,14 +1,15 @@
 package vault
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"encoding/base64"
-	"encoding/hex"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	errors_handler "passman/internal/errorHandling"
+	"path/filepath"
+
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 type VaultProp struct {
@@ -19,9 +20,46 @@ type VaultProp struct {
 const VAULT_LOCATION = "~/.passman/.vault"
 
 func CreateVault(password string) {
-	encryptedData := encrypt(password, "[]")
+	// Expand the user's home directory symbol "~"
+	expandedPath, err := expandPath(VAULT_LOCATION)
+	if err != nil {
+		panic(fmt.Sprintf("Error expanding path: %s", err))
+	}
 
-	err := os.WriteFile(VAULT_LOCATION, []byte(encryptedData), 0644)
+	// Get the directory path
+	vaultDir := filepath.Dir(expandedPath)
+
+	// Check if the directory exists, and create it if not
+	if _, err := os.Stat(vaultDir); os.IsNotExist(err) {
+		err := os.MkdirAll(vaultDir, 0700) // 0700 is read/write/execute for owner only
+		if err != nil {
+			panic(fmt.Sprintf("Error creating directory: %s", err))
+		}
+		fmt.Println("Created directory:", vaultDir)
+	}
+
+	// Now you can safely check for and create the file
+	if !fileExists(expandedPath) {
+		file, err := os.Create(expandedPath)
+		if err != nil {
+			panic(fmt.Sprintf("Error while creating file: %s", err))
+		}
+		defer file.Close()
+		fmt.Println("Vault file created.")
+	} else {
+		fmt.Println("Vault file already exists.")
+	}
+	var vaultProps [0]VaultProp
+	vaultPropsByte, err := json.Marshal(&vaultProps)
+	errors_handler.Handling(err)
+
+	var key [32]byte
+	copy(key[:], []byte(password))
+
+	encryptedData := Encrypt(&key, vaultPropsByte)
+	errors_handler.Handling(err)
+
+	err = os.WriteFile(expandedPath, []byte(encryptedData), 0644)
 	errors_handler.Handling(err)
 
 	fmt.Println("Vault Created")
@@ -32,17 +70,24 @@ func AddDataToVault(password string, newVaultProp VaultProp) {
 
 	vault = append(vault, newVaultProp)
 
-	vaultJson, err := json.Marshal(&vault)
+	vaultByte, err := json.Marshal(&vault)
 	errors_handler.Handling(err)
 
-	result := encrypt(password, string(vaultJson))
+	var key [32]byte
+	copy(key[:], []byte(password))
+
+	result := Encrypt(&key, vaultByte)
+	errors_handler.Handling(err)
 	os.WriteFile(VAULT_LOCATION, []byte(result), 0644)
 }
 
 func GetVaultData(password string) []VaultProp {
 	val, err := os.ReadFile(VAULT_LOCATION)
 	errors_handler.Handling(err)
-	decryptedValue := decrypt(password, string(val))
+
+	var key [32]byte
+	copy(key[:], []byte(password))
+	decryptedValue, _ := Decrypt(&key, val)
 
 	var vault []VaultProp
 
@@ -52,42 +97,41 @@ func GetVaultData(password string) []VaultProp {
 	return vault
 }
 
-func encrypt(password string, value string) string {
-	key, err := hex.DecodeString(value)
-	errors_handler.Handling(err)
-
-	plainText := []byte(value)
-
-	block, err := aes.NewCipher(key)
-	errors_handler.Panic(err)
-
-	ciphertext := make([]byte, aes.BlockSize+len(plainText))
-	iv := ciphertext[:aes.BlockSize]
-
-	stream := cipher.NewCFBEncrypter(block, iv)
-	stream.XORKeyStream(ciphertext[aes.BlockSize:], plainText)
-
-	return base64.URLEncoding.EncodeToString(ciphertext)
-}
-
-func decrypt(keyString string, stringToDecrypt string) string {
-	key, _ := hex.DecodeString(keyString)
-	ciphertext, _ := base64.URLEncoding.DecodeString(stringToDecrypt)
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
+func Encrypt(key *[32]byte, data []byte) []byte {
+	var nonce [24]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
 		panic(err)
 	}
 
-	if len(ciphertext) < aes.BlockSize {
-		panic("ciphertext too short")
+	encrypted := secretbox.Seal(nonce[:], data, &nonce, key)
+	return encrypted
+}
+
+// Decrypt decrypts data using a secretbox.
+func Decrypt(key *[32]byte, data []byte) ([]byte, bool) {
+	var nonce [24]byte
+	copy(nonce[:], data[:24])
+
+	decrypted, ok := secretbox.Open(nil, data[24:], &nonce, key)
+	return decrypted, ok
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
 	}
-	iv := ciphertext[:aes.BlockSize]
-	ciphertext = ciphertext[aes.BlockSize:]
+	// Return false if it's a directory
+	return !info.IsDir()
+}
 
-	stream := cipher.NewCFBDecrypter(block, iv)
-
-	stream.XORKeyStream(ciphertext, ciphertext)
-
-	return fmt.Sprintf("%s", ciphertext)
+func expandPath(path string) (string, error) {
+	if len(path) > 1 && path[0:1] == "~" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(homeDir, path[1:]), nil
+	}
+	return path, nil
 }

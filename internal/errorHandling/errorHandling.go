@@ -1,10 +1,9 @@
 package errors_handler
 
-import "log"
-
 func Handling(err error) {
 	if err != nil {
-		log.Fatal(err.Error())
+		// log.Fatal(err.Error())
+		panic(err.Error())
 	}
 }
 
